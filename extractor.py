@@ -12,8 +12,8 @@ Sync pattern (silence/gap marker): 00 08 c6 01 00 ca 00 c0  (8 bytes, repeated �
 
 Songs: decode directly as signed 8-bit PCM at 8000 Hz.
 Voice clips: decode as Dialogic VOX ADPCM at 8000 Hz; brute-force
-  alignment shifts 0–16 bytes and keep the shift with lowest spectral
-  flatness (most tonal, least noise-like).
+  alignment shifts 0–16 bytes × {normal, nibble-swapped} and keep the
+  candidate with lowest spectral flatness (most tonal, least noise-like).
 """
 
 import os, sys, struct, subprocess, argparse
@@ -111,54 +111,69 @@ def decode_vox(binfile, outfile, rate=8000):
     return r.returncode == 0
 
 
-def find_best_shift(clip_data, out_dir, prefix, rate=8000, max_shift=16):
-    """Try alignment shifts 0–max_shift bytes, decode VOX ADPCM at *rate* Hz each time.
+def _swap_nibbles(data: bytes) -> bytes:
+    """Swap the high and low nibble of every byte: (b>>4)|((b&0x0F)<<4)."""
+    arr = np.frombuffer(data, dtype=np.uint8)
+    return ((arr >> 4) | ((arr & 0x0F) << 4)).tobytes()
 
-    Returns (shift, final_wav_path, sfm, dur, clip_pct) for the shift with the
-    lowest spectral flatness (most tonal / least noise-like), or None if every
-    attempt fails.  Only the winning WAV is kept; all others are deleted.
+
+def find_best_shift(clip_data, out_dir, prefix, rate=8000, max_shift=16):
+    """Search for the best-aligned VOX ADPCM decode across two nibble variants
+    and byte shifts 0–max_shift.
+
+    Candidates tested (2 × (max_shift+1) = 34 by default):
+      - normal bytes,        shift 0–16
+      - nibble-swapped bytes, shift 0–16
+
+    Returns (shift, nibble_swap, final_wav_path, sfm, dur, clip_pct) for the
+    candidate with the lowest spectral flatness (most tonal / least noise-like),
+    or None if every attempt fails.  `nibble_swap` is a bool indicating whether
+    the winning candidate used nibble-swapped input.  Only the winning WAV is kept.
     """
-    best_info = None   # (shift, sfm, dur, clip_pct)
+    best_info = None   # (shift, nibble_swap, sfm, dur, clip_pct)
     best_wav  = None   # Path of the current best WAV
 
-    for shift in range(max_shift + 1):
-        sliced = clip_data[shift:]
-        if len(sliced) < MIN_CLIP_BYTES:
-            continue
+    for nibble_swap in (False, True):
+        base = _swap_nibbles(clip_data) if nibble_swap else clip_data
+        tag  = "ns" if nibble_swap else "no"
 
-        tmp_bin = out_dir / f"{prefix}_shift{shift:02d}.bin"
-        tmp_wav = out_dir / f"{prefix}_shift{shift:02d}.wav"
-        tmp_bin.write_bytes(sliced)
+        for shift in range(max_shift + 1):
+            sliced = base[shift:]
+            if len(sliced) < MIN_CLIP_BYTES:
+                continue
 
-        ok = decode_vox(tmp_bin, tmp_wav, rate)
-        tmp_bin.unlink(missing_ok=True)
+            tmp_bin = out_dir / f"{prefix}_{tag}_s{shift:02d}.bin"
+            tmp_wav = out_dir / f"{prefix}_{tag}_s{shift:02d}.wav"
+            tmp_bin.write_bytes(sliced)
 
-        if not ok:
-            tmp_wav.unlink(missing_ok=True)
-            continue
+            ok = decode_vox(tmp_bin, tmp_wav, rate)
+            tmp_bin.unlink(missing_ok=True)
 
-        q = quality(tmp_wav)
-        if q is None:
-            tmp_wav.unlink(missing_ok=True)
-            continue
+            if not ok:
+                tmp_wav.unlink(missing_ok=True)
+                continue
 
-        clip_pct, sfm, dur = q
-        if best_info is None or sfm < best_info[1]:
-            # Drop previous best's temp file and promote this one
-            if best_wav is not None:
-                best_wav.unlink(missing_ok=True)
-            best_info = (shift, sfm, dur, clip_pct)
-            best_wav  = tmp_wav
-        else:
-            tmp_wav.unlink(missing_ok=True)
+            q = quality(tmp_wav)
+            if q is None:
+                tmp_wav.unlink(missing_ok=True)
+                continue
+
+            clip_pct, sfm, dur = q
+            if best_info is None or sfm < best_info[2]:
+                if best_wav is not None:
+                    best_wav.unlink(missing_ok=True)
+                best_info = (shift, nibble_swap, sfm, dur, clip_pct)
+                best_wav  = tmp_wav
+            else:
+                tmp_wav.unlink(missing_ok=True)
 
     if best_info is None or best_wav is None:
         return None
 
-    shift, sfm, dur, clip_pct = best_info
-    final_wav = out_dir / f"{prefix}_vox{rate}.wav"
+    shift, nibble_swap, sfm, dur, clip_pct = best_info
+    final_wav = out_dir / f"{prefix}_best_vox{rate}.wav"
     best_wav.rename(final_wav)
-    return shift, final_wav, sfm, dur, clip_pct
+    return shift, nibble_swap, final_wav, sfm, dur, clip_pct
 
 
 def decode_pcm(binfile, outfile, rate=8000):
@@ -229,8 +244,9 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
         raw.write_bytes(data[start:end])
         result = find_best_shift(data[start:end], out_dir, f"{name.lower()}_pre_{j:03d}")
         if result:
-            shift, wav, sfm, dur, clip_pct = result
-            print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B  {wav.name}  {dur:.2f}s  clip={clip_pct:.0f}%  sfm={sfm:.3f}")
+            shift, nibble_swap, wav, sfm, dur, clip_pct = result
+            ns_tag = " nibble-swap" if nibble_swap else ""
+            print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}  {wav.name}  {dur:.2f}s  clip={clip_pct:.0f}%  sfm={sfm:.3f}")
         else:
             print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  (decode failed)")
 
@@ -243,8 +259,9 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
         raw.write_bytes(data[start:end])
         result = find_best_shift(data[start:end], out_dir, f"{name.lower()}_post_{j:03d}")
         if result:
-            shift, wav, sfm, dur, clip_pct = result
-            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B  {wav.name}  {dur:.2f}s  clip={clip_pct:.0f}%  sfm={sfm:.3f}")
+            shift, nibble_swap, wav, sfm, dur, clip_pct = result
+            ns_tag = " nibble-swap" if nibble_swap else ""
+            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}  {wav.name}  {dur:.2f}s  clip={clip_pct:.0f}%  sfm={sfm:.3f}")
         else:
             print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  (decode failed)")
 
