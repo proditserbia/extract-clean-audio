@@ -403,7 +403,7 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
             label, dist_str = _classify(sfm, clip_pct, adpcm_errors, ref_fp, clip_fp)
             if label == "[VALID]":
                 print(f"  pre_{j:03d}  offset=0x{start:07x}  raw_size={size}B"
-                      f"  first32={data[start:start+32].hex()}")
+                      f"  first_32_bytes={data[start:start+32].hex()}")
                 print(f"           wav={wav.name}  dur={dur:.2f}s  shift={shift:2d}B{ns_tag}")
                 print(f"           adpcm_err={adpcm_errors}  clip={clip_pct:.1f}%"
                       f"  sfm={sfm:.3f}  {dist_str}  {label}")
@@ -459,7 +459,7 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
             if label == "[VALID]":
                 ctrl_tag = "  *** CONFIRMED POSITIVE CONTROL ***" if j == ref_index else ""
                 print(f"  post_{j:03d}  offset=0x{start:07x}  raw_size={size}B"
-                      f"  first32={data[start:start+32].hex()}{ctrl_tag}")
+                      f"  first_32_bytes={data[start:start+32].hex()}{ctrl_tag}")
                 print(f"           wav={wav.name}  dur={dur:.2f}s  shift={shift:2d}B{ns_tag}")
                 print(f"           adpcm_err={adpcm_errors}  clip={clip_pct:.1f}%"
                       f"  sfm={sfm:.3f}  {dist_str}  {label}")
