@@ -18,9 +18,13 @@ Voice clips: decode as Dialogic VOX ADPCM at 8000 Hz; brute-force
     2. Clipping percentage (secondary) – hard reject if > CLIP_REJECT_PCT
     3. Spectral flatness (tertiary) – lower is more tonal / less noise-like
 
-  Confirmed positive control: tom_post_022_best_vox8000.wav (shift=0, no nibble swap)
-  All other clips are validated against this reference fingerprint before being
-  classified as [VALID] (likely audio) or [NOISE] (likely not audio).
+  Confirmed positive control: located by exact file offset (CONFIRMED_CTRL_OFFSETS),
+  not by clip label/index.  The post-song clip whose byte range contains that offset
+  is used as the reference fingerprint.  All other clips are validated against it
+  before being classified as [VALID] (likely audio) or [NOISE] (likely not audio).
+
+  Only [VALID] clips receive full diagnostic output (offset, raw size, first 32 bytes,
+  SoX ADPCM errors, clipping %, SFM, classification).
 """
 
 import os, re, sys, struct, subprocess, argparse
@@ -32,6 +36,15 @@ FILE_CFG = {
     "Tom":    {"song_start": 0x34E00, "song_end": 0x10D800},
     "Angela": {"song_start": 0x35000, "song_end": 0x10D000},
     "Ginger": {"song_start": 0x35000, "song_end": 0x10D000},
+}
+
+# Confirmed audible positive-control file offsets (verified by manual listening).
+# The post-song clip whose byte range *contains* this offset is used as the
+# reference fingerprint.  Set to None for files where no control is known yet.
+CONFIRMED_CTRL_OFFSETS = {
+    "Tom":    0x1A2B10,   # tom_post_022 – confirmed Jingle Bells clip
+    "Angela": None,
+    "Ginger": None,
 }
 
 BASE_ADDR   = 0x10000000
@@ -331,6 +344,19 @@ def _classify(sfm, clip_pct, adpcm_errors, ref_fp, clip_fp):
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
+def _find_ctrl_index(post_clips, confirmed_offset):
+    """Return the index of the post-song clip whose range contains confirmed_offset.
+
+    Returns None if confirmed_offset is None or not covered by any clip.
+    """
+    if confirmed_offset is None:
+        return None
+    for j, (start, end) in enumerate(post_clips):
+        if start <= confirmed_offset < end:
+            return j
+    return None
+
+
 def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
     name = bin_path.stem          # "Tom", "Angela", "Ginger"
     cfg  = FILE_CFG.get(name)
@@ -363,8 +389,6 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
     pre_clips = get_presong_clips(data, song_start)
     print(f"\n[pre-song clips]  {len(pre_clips)} clips found via seek table")
 
-    # Reference fingerprint: seeded from post_022 (index 22 in post-song clips)
-    # computed lazily on first successful decode if the confirmed clip is absent.
     ref_fp  = None
     ref_src = None
 
@@ -377,33 +401,50 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
             shift, nibble_swap, wav, sfm, dur, clip_pct, adpcm_errors = result
             ns_tag = " nibble-swap" if nibble_swap else ""
             label, dist_str = _classify(sfm, clip_pct, adpcm_errors, ref_fp, clip_fp)
-            print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}"
-                  f"  {wav.name}  {dur:.2f}s"
-                  f"  clip={clip_pct:.0f}%  sfm={sfm:.3f}  adpcm_err={adpcm_errors}"
-                  f"  {dist_str}  {label}")
+            if label == "[VALID]":
+                print(f"  pre_{j:03d}  offset=0x{start:07x}  raw_size={size}B"
+                      f"  first32={data[start:start+32].hex()}")
+                print(f"           wav={wav.name}  dur={dur:.2f}s  shift={shift:2d}B{ns_tag}")
+                print(f"           adpcm_err={adpcm_errors}  clip={clip_pct:.1f}%"
+                      f"  sfm={sfm:.3f}  {dist_str}  {label}")
+            else:
+                print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  {label}")
         else:
             print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  (decode failed / hard-rejected)")
 
     # ── 3. Post-song voice clips (ADPCM, sync-run boundaries) ────────────────
     post_clips = get_postsong_clips(data, song_end)
     print(f"\n[post-song clips]  {len(post_clips)} clips found via sync-pattern")
-    print(f"  Reference: post_022 (confirmed positive control — no shift, no nibble swap)")
-    print(f"  Validation thresholds: clip≤{CLIP_REJECT_PCT}%  adpcm_err≤{ADPCM_ERR_REJECT}"
-          f"  sfm<{SFM_NOISE_THRESH}  ref_dist≤{REF_DIST_THRESH}")
-    print()
 
-    # Seed reference fingerprint from post_022 raw bytes (shift=0, no nibble swap)
-    ref_index = 22
-    if len(post_clips) > ref_index:
+    # ── Locate the confirmed positive control by offset, not by label ────────
+    confirmed_offset = CONFIRMED_CTRL_OFFSETS.get(name)
+    ref_index = _find_ctrl_index(post_clips, confirmed_offset)
+
+    if ref_index is not None:
         ref_start, ref_end = post_clips[ref_index]
-        ref_fp  = byte_fingerprint(data[ref_start:ref_end])
-        ref_src = f"post_{ref_index:03d} (0x{ref_start:07x})"
+        ref_raw = data[ref_start:ref_end]
+        ref_fp  = byte_fingerprint(ref_raw)
+        ref_src = f"post_{ref_index:03d}"
         fp = ref_fp
-        print(f"  [reference fingerprint]  {ref_src}")
-        print(f"    header : {fp['header']}")
-        print(f"    entropy: {fp['entropy']:.4f} bits/byte")
-        print(f"    mean   : {fp['mean']:.2f}  std: {fp['std']:.2f}")
-        print()
+        print(f"  [positive control]  {ref_src}")
+        print(f"    confirmed offset : 0x{ref_start:07x}")
+        print(f"    raw block size   : {ref_end - ref_start} bytes")
+        print(f"    first 32 bytes   : {ref_raw[:32].hex()}")
+        print(f"    entropy          : {fp['entropy']:.4f} bits/byte")
+        print(f"    mean / std       : {fp['mean']:.2f} / {fp['std']:.2f}")
+        print(f"    header (16B)     : {fp['header']}")
+        print(f"  NOTE: identity verified by exact offset match to CONFIRMED_CTRL_OFFSETS['{name}']"
+              f" = 0x{confirmed_offset:x}")
+    elif confirmed_offset is not None:
+        print(f"  WARNING: confirmed offset 0x{confirmed_offset:x} not found in any post-song clip!")
+        print(f"           Reference fingerprint will be unset; all clips will be judged without it.")
+    else:
+        print(f"  NOTE: no confirmed positive control offset for '{name}'; "
+              f"fingerprint comparison disabled.")
+
+    print(f"\n  Validation thresholds: clip≤{CLIP_REJECT_PCT}%  adpcm_err≤{ADPCM_ERR_REJECT}"
+          f"  sfm<{SFM_NOISE_THRESH}  ref_dist≤{REF_DIST_THRESH}")
+    print(f"  Printing full diagnostics for [VALID] clips only.\n")
 
     for j, (start, end) in enumerate(post_clips):
         size = end - start
@@ -411,29 +452,21 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
         clip_fp = byte_fingerprint(clip_raw)
         result = find_best_shift(clip_raw, out_dir, f"{name.lower()}_post_{j:03d}")
 
-        # For post_022 specifically, also show its raw fingerprint detail
-        if j == ref_index and ref_fp is not None:
-            dist_to_self = fingerprint_distance(ref_fp, clip_fp)
-            print(f"  post_{j:03d}  *** CONFIRMED POSITIVE CONTROL ***")
-            print(f"           header={clip_fp['header']}  entropy={clip_fp['entropy']:.4f}"
-                  f"  mean={clip_fp['mean']:.2f}  std={clip_fp['std']:.2f}"
-                  f"  self_dist={dist_to_self:.4f}")
-
         if result:
             shift, nibble_swap, wav, sfm, dur, clip_pct, adpcm_errors = result
             ns_tag = " nibble-swap" if nibble_swap else ""
             label, dist_str = _classify(sfm, clip_pct, adpcm_errors, ref_fp, clip_fp)
-            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}"
-                  f"  {wav.name}  {dur:.2f}s"
-                  f"  clip={clip_pct:.0f}%  sfm={sfm:.3f}  adpcm_err={adpcm_errors}"
-                  f"  {dist_str}  {label}")
+            if label == "[VALID]":
+                ctrl_tag = "  *** CONFIRMED POSITIVE CONTROL ***" if j == ref_index else ""
+                print(f"  post_{j:03d}  offset=0x{start:07x}  raw_size={size}B"
+                      f"  first32={data[start:start+32].hex()}{ctrl_tag}")
+                print(f"           wav={wav.name}  dur={dur:.2f}s  shift={shift:2d}B{ns_tag}")
+                print(f"           adpcm_err={adpcm_errors}  clip={clip_pct:.1f}%"
+                      f"  sfm={sfm:.3f}  {dist_str}  {label}")
+            else:
+                print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  {label}")
         else:
-            dist = fingerprint_distance(ref_fp, clip_fp) if ref_fp else None
-            dist_str = f"ref_dist={dist:.3f}" if dist is not None else "ref=n/a"
-            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  (decode failed / hard-rejected)"
-                  f"  {dist_str}"
-                  f"  header={clip_fp['header']}"
-                  f"  entropy={clip_fp['entropy']:.4f}")
+            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  (decode failed / hard-rejected)")
 
 
 def auto_detect_boundaries(data):
