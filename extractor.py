@@ -13,10 +13,17 @@ Sync pattern (silence/gap marker): 00 08 c6 01 00 ca 00 c0  (8 bytes, repeated �
 Songs: decode directly as signed 8-bit PCM at 8000 Hz.
 Voice clips: decode as Dialogic VOX ADPCM at 8000 Hz; brute-force
   alignment shifts 0–16 bytes × {normal, nibble-swapped} and keep the
-  candidate with lowest spectral flatness (most tonal, least noise-like).
+  best candidate scored by multi-criteria validation:
+    1. ADPCM state errors (primary, from SoX stderr) – lower is better
+    2. Clipping percentage (secondary) – hard reject if > CLIP_REJECT_PCT
+    3. Spectral flatness (tertiary) – lower is more tonal / less noise-like
+
+  Confirmed positive control: tom_post_022_best_vox8000.wav (shift=0, no nibble swap)
+  All other clips are validated against this reference fingerprint before being
+  classified as [VALID] (likely audio) or [NOISE] (likely not audio).
 """
 
-import os, sys, struct, subprocess, argparse
+import os, re, sys, struct, subprocess, argparse
 import numpy as np
 from pathlib import Path
 
@@ -32,6 +39,12 @@ TABLE_START = 0x1004
 SYNC_PAT    = bytes([0x00, 0x08, 0xc6, 0x01, 0x00, 0xca, 0x00, 0xc0])
 MIN_SYNC_RUN = 3   # ≥3 consecutive 8-byte patterns = real gap between clips
 MIN_CLIP_BYTES = 256
+
+# Validation thresholds
+CLIP_REJECT_PCT   = 15.0   # hard-reject clips with clipping > this %
+ADPCM_ERR_REJECT  = 200    # hard-reject clips with ADPCM state errors > this
+SFM_NOISE_THRESH  = 0.85   # SFM ≥ this indicates likely noise (not tonal audio)
+REF_DIST_THRESH   = 0.30   # fingerprint distance > this → not similar to reference
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -103,12 +116,35 @@ def get_postsong_clips(data, song_end):
 
 
 def decode_vox(binfile, outfile, rate=8000):
-    """Decode Dialogic VOX ADPCM with sox."""
+    """Decode Dialogic VOX ADPCM with sox.
+
+    Returns (success: bool, stderr: str).
+    """
     r = subprocess.run(
         ["sox", "-t", "vox", "-r", str(rate), "-c", "1", str(binfile), str(outfile)],
-        capture_output=True
+        capture_output=True, text=True
     )
-    return r.returncode == 0
+    return r.returncode == 0, r.stderr
+
+
+def parse_adpcm_errors(stderr: str) -> int:
+    """Parse ADPCM state error count from SoX stderr.
+
+    SoX vox handler may emit lines such as:
+      'sox WARN vox: ADPCM state errors: 45'
+      'vox: invalid ADPCM state at byte ...'
+    Returns the highest integer found near 'ADPCM' / 'error' keywords, or
+    a count of individual error lines if no number is found.
+    """
+    # Try to find an explicit count: "ADPCM state errors: N" or "N errors"
+    m = re.search(r'ADPCM\s+state\s+errors?[:\s]*(\d+)', stderr, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)\s+ADPCM\s+(?:state\s+)?errors?', stderr, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # Fall back to counting individual error / invalid lines
+    return len(re.findall(r'(?:ADPCM|vox).*(?:error|invalid)', stderr, re.IGNORECASE))
 
 
 def _swap_nibbles(data: bytes) -> bytes:
@@ -117,21 +153,69 @@ def _swap_nibbles(data: bytes) -> bytes:
     return ((arr >> 4) | ((arr & 0x0F) << 4)).tobytes()
 
 
+def byte_fingerprint(data: bytes) -> dict:
+    """Compute structural statistics of raw clip bytes.
+
+    Returns a dict with:
+      header   – first 16 bytes (hex string)
+      entropy  – Shannon entropy (bits per byte, 0–8; ~7.9 for compressed audio)
+      hist     – normalised 256-bin byte histogram (np.ndarray, sums to 1.0)
+      mean     – mean byte value
+      std      – std of byte values
+    """
+    arr = np.frombuffer(data, dtype=np.uint8).astype(np.float64)
+    hist, _ = np.histogram(arr, bins=256, range=(0, 256))
+    hist_norm = hist / hist.sum() if hist.sum() > 0 else hist.astype(float)
+    # Shannon entropy
+    p = hist_norm[hist_norm > 0]
+    entropy = float(-np.sum(p * np.log2(p)))
+    return {
+        "header":  data[:16].hex(),
+        "entropy": entropy,
+        "hist":    hist_norm,
+        "mean":    float(arr.mean()),
+        "std":     float(arr.std()),
+    }
+
+
+def fingerprint_distance(fp_a: dict, fp_b: dict) -> float:
+    """Return a distance in [0, 1] between two byte fingerprints.
+
+    Combines:
+      - absolute entropy difference (normalised to [0,1] over 8-bit range)
+      - mean byte value difference (normalised)
+      - histogram L1 distance (already in [0, 2]; normalised to [0, 1])
+    """
+    d_entropy = abs(fp_a["entropy"] - fp_b["entropy"]) / 8.0
+    d_mean    = abs(fp_a["mean"]    - fp_b["mean"])    / 255.0
+    d_hist    = float(np.sum(np.abs(fp_a["hist"] - fp_b["hist"]))) / 2.0
+    return (d_entropy + d_mean + d_hist) / 3.0
+
+
 def find_best_shift(clip_data, out_dir, prefix, rate=8000, max_shift=16):
     """Search for the best-aligned VOX ADPCM decode across two nibble variants
     and byte shifts 0–max_shift.
 
     Candidates tested (2 × (max_shift+1) = 34 by default):
-      - normal bytes,        shift 0–16
+      - normal bytes,         shift 0–16
       - nibble-swapped bytes, shift 0–16
 
-    Returns (shift, nibble_swap, final_wav_path, sfm, dur, clip_pct) for the
-    candidate with the lowest spectral flatness (most tonal / least noise-like),
-    or None if every attempt fails.  `nibble_swap` is a bool indicating whether
-    the winning candidate used nibble-swapped input.  Only the winning WAV is kept.
+    Scoring uses multi-criteria validation:
+      1. ADPCM state errors from SoX stderr (primary – lower is better)
+      2. Clipping percentage (secondary – hard reject if > CLIP_REJECT_PCT)
+      3. Spectral flatness / SFM (tertiary – lower is more tonal)
+
+    Hard rejects:
+      - clipping > CLIP_REJECT_PCT %
+      - ADPCM state errors > ADPCM_ERR_REJECT
+
+    Returns (shift, nibble_swap, final_wav_path, sfm, dur, clip_pct, adpcm_errors)
+    for the winning candidate, or None if every attempt fails or is rejected.
+    Only the winning WAV is kept.
     """
-    best_info = None   # (shift, nibble_swap, sfm, dur, clip_pct)
-    best_wav  = None   # Path of the current best WAV
+    best_score = None   # (adpcm_errors, clip_pct, sfm) – lower is better lexicographically
+    best_info  = None   # (shift, nibble_swap, sfm, dur, clip_pct, adpcm_errors)
+    best_wav   = None   # Path of the current best WAV
 
     for nibble_swap in (False, True):
         base = _swap_nibbles(clip_data) if nibble_swap else clip_data
@@ -146,7 +230,7 @@ def find_best_shift(clip_data, out_dir, prefix, rate=8000, max_shift=16):
             tmp_wav = out_dir / f"{prefix}_{tag}_s{shift:02d}.wav"
             tmp_bin.write_bytes(sliced)
 
-            ok = decode_vox(tmp_bin, tmp_wav, rate)
+            ok, stderr = decode_vox(tmp_bin, tmp_wav, rate)
             tmp_bin.unlink(missing_ok=True)
 
             if not ok:
@@ -159,28 +243,40 @@ def find_best_shift(clip_data, out_dir, prefix, rate=8000, max_shift=16):
                 continue
 
             clip_pct, sfm, dur = q
-            if best_info is None or sfm < best_info[2]:
+            adpcm_errors = parse_adpcm_errors(stderr)
+
+            # Hard-reject candidates with excessive clipping or ADPCM errors
+            if clip_pct > CLIP_REJECT_PCT:
+                tmp_wav.unlink(missing_ok=True)
+                continue
+            if adpcm_errors > ADPCM_ERR_REJECT:
+                tmp_wav.unlink(missing_ok=True)
+                continue
+
+            score = (adpcm_errors, clip_pct, sfm)
+            if best_score is None or score < best_score:
                 if best_wav is not None:
                     best_wav.unlink(missing_ok=True)
-                best_info = (shift, nibble_swap, sfm, dur, clip_pct)
-                best_wav  = tmp_wav
+                best_score = score
+                best_info  = (shift, nibble_swap, sfm, dur, clip_pct, adpcm_errors)
+                best_wav   = tmp_wav
             else:
                 tmp_wav.unlink(missing_ok=True)
 
     if best_info is None or best_wav is None:
         return None
 
-    shift, nibble_swap, sfm, dur, clip_pct = best_info
+    shift, nibble_swap, sfm, dur, clip_pct, adpcm_errors = best_info
     final_wav = out_dir / f"{prefix}_best_vox{rate}.wav"
     best_wav.rename(final_wav)
-    return shift, nibble_swap, final_wav, sfm, dur, clip_pct
+    return shift, nibble_swap, final_wav, sfm, dur, clip_pct, adpcm_errors
 
 
 def decode_pcm(binfile, outfile, rate=8000):
     """Decode signed 8-bit PCM with sox."""
     r = subprocess.run(
         ["sox", "-t", "s8", "-r", str(rate), "-c", "1", str(binfile), str(outfile)],
-        capture_output=True
+        capture_output=True, text=True
     )
     return r.returncode == 0
 
@@ -203,6 +299,34 @@ def quality(wavfile_path):
         return clip_pct, sfm, dur
     except Exception:
         return None
+
+
+def _classify(sfm, clip_pct, adpcm_errors, ref_fp, clip_fp):
+    """Return a classification label and distance string for a decoded clip.
+
+    A clip is [VALID] when ALL of the following hold:
+      - ADPCM state errors ≤ ADPCM_ERR_REJECT  (already pre-filtered, but check again)
+      - clipping ≤ CLIP_REJECT_PCT              (already pre-filtered)
+      - SFM < SFM_NOISE_THRESH                  (reasonably tonal)
+      - fingerprint distance to reference ≤ REF_DIST_THRESH  (similar raw structure)
+    Otherwise [NOISE].
+    """
+    if ref_fp is None or clip_fp is None:
+        dist = None
+        dist_str = "ref=n/a"
+        similar = True  # cannot judge without reference
+    else:
+        dist = fingerprint_distance(ref_fp, clip_fp)
+        dist_str = f"ref_dist={dist:.3f}"
+        similar = dist <= REF_DIST_THRESH
+
+    tonal   = sfm < SFM_NOISE_THRESH
+    low_err = adpcm_errors <= ADPCM_ERR_REJECT
+    low_clp = clip_pct <= CLIP_REJECT_PCT
+
+    valid = tonal and low_err and low_clp and similar
+    label = "[VALID]" if valid else "[NOISE]"
+    return label, dist_str
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -238,32 +362,78 @@ def process_file(bin_path: Path, out_dir: Path, rates=(8000, 11025, 16000)):
     # ── 2. Pre-song voice clips (ADPCM, seek-table boundaries) ───────────────
     pre_clips = get_presong_clips(data, song_start)
     print(f"\n[pre-song clips]  {len(pre_clips)} clips found via seek table")
+
+    # Reference fingerprint: seeded from post_022 (index 22 in post-song clips)
+    # computed lazily on first successful decode if the confirmed clip is absent.
+    ref_fp  = None
+    ref_src = None
+
     for j, (start, end) in enumerate(pre_clips):
         size = end - start
-        raw = out_dir / f"{name.lower()}_pre_{j:03d}.bin"
-        raw.write_bytes(data[start:end])
-        result = find_best_shift(data[start:end], out_dir, f"{name.lower()}_pre_{j:03d}")
+        clip_raw = data[start:end]
+        clip_fp = byte_fingerprint(clip_raw)
+        result = find_best_shift(clip_raw, out_dir, f"{name.lower()}_pre_{j:03d}")
         if result:
-            shift, nibble_swap, wav, sfm, dur, clip_pct = result
+            shift, nibble_swap, wav, sfm, dur, clip_pct, adpcm_errors = result
             ns_tag = " nibble-swap" if nibble_swap else ""
-            print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}  {wav.name}  {dur:.2f}s  clip={clip_pct:.0f}%  sfm={sfm:.3f}")
+            label, dist_str = _classify(sfm, clip_pct, adpcm_errors, ref_fp, clip_fp)
+            print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}"
+                  f"  {wav.name}  {dur:.2f}s"
+                  f"  clip={clip_pct:.0f}%  sfm={sfm:.3f}  adpcm_err={adpcm_errors}"
+                  f"  {dist_str}  {label}")
         else:
-            print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  (decode failed)")
+            print(f"  pre_{j:03d}  0x{start:07x} {size:7d}B  (decode failed / hard-rejected)")
 
     # ── 3. Post-song voice clips (ADPCM, sync-run boundaries) ────────────────
     post_clips = get_postsong_clips(data, song_end)
     print(f"\n[post-song clips]  {len(post_clips)} clips found via sync-pattern")
+    print(f"  Reference: post_022 (confirmed positive control — no shift, no nibble swap)")
+    print(f"  Validation thresholds: clip≤{CLIP_REJECT_PCT}%  adpcm_err≤{ADPCM_ERR_REJECT}"
+          f"  sfm<{SFM_NOISE_THRESH}  ref_dist≤{REF_DIST_THRESH}")
+    print()
+
+    # Seed reference fingerprint from post_022 raw bytes (shift=0, no nibble swap)
+    ref_index = 22
+    if len(post_clips) > ref_index:
+        ref_start, ref_end = post_clips[ref_index]
+        ref_fp  = byte_fingerprint(data[ref_start:ref_end])
+        ref_src = f"post_{ref_index:03d} (0x{ref_start:07x})"
+        fp = ref_fp
+        print(f"  [reference fingerprint]  {ref_src}")
+        print(f"    header : {fp['header']}")
+        print(f"    entropy: {fp['entropy']:.4f} bits/byte")
+        print(f"    mean   : {fp['mean']:.2f}  std: {fp['std']:.2f}")
+        print()
+
     for j, (start, end) in enumerate(post_clips):
         size = end - start
-        raw = out_dir / f"{name.lower()}_post_{j:03d}.bin"
-        raw.write_bytes(data[start:end])
-        result = find_best_shift(data[start:end], out_dir, f"{name.lower()}_post_{j:03d}")
+        clip_raw = data[start:end]
+        clip_fp = byte_fingerprint(clip_raw)
+        result = find_best_shift(clip_raw, out_dir, f"{name.lower()}_post_{j:03d}")
+
+        # For post_022 specifically, also show its raw fingerprint detail
+        if j == ref_index and ref_fp is not None:
+            dist_to_self = fingerprint_distance(ref_fp, clip_fp)
+            print(f"  post_{j:03d}  *** CONFIRMED POSITIVE CONTROL ***")
+            print(f"           header={clip_fp['header']}  entropy={clip_fp['entropy']:.4f}"
+                  f"  mean={clip_fp['mean']:.2f}  std={clip_fp['std']:.2f}"
+                  f"  self_dist={dist_to_self:.4f}")
+
         if result:
-            shift, nibble_swap, wav, sfm, dur, clip_pct = result
+            shift, nibble_swap, wav, sfm, dur, clip_pct, adpcm_errors = result
             ns_tag = " nibble-swap" if nibble_swap else ""
-            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}  {wav.name}  {dur:.2f}s  clip={clip_pct:.0f}%  sfm={sfm:.3f}")
+            label, dist_str = _classify(sfm, clip_pct, adpcm_errors, ref_fp, clip_fp)
+            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  shift={shift:2d}B{ns_tag}"
+                  f"  {wav.name}  {dur:.2f}s"
+                  f"  clip={clip_pct:.0f}%  sfm={sfm:.3f}  adpcm_err={adpcm_errors}"
+                  f"  {dist_str}  {label}")
         else:
-            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  (decode failed)")
+            dist = fingerprint_distance(ref_fp, clip_fp) if ref_fp else None
+            dist_str = f"ref_dist={dist:.3f}" if dist is not None else "ref=n/a"
+            print(f"  post_{j:03d}  0x{start:07x} {size:7d}B  (decode failed / hard-rejected)"
+                  f"  {dist_str}"
+                  f"  header={clip_fp['header']}"
+                  f"  entropy={clip_fp['entropy']:.4f}")
 
 
 def auto_detect_boundaries(data):
